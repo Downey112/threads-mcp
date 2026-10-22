@@ -28,11 +28,11 @@ Meta's limits: 2,200 keyword searches and 1,000 profile lookups per user per rol
    ```
    uv run --script C:\Users\courts\threads-mcp\server.py setup
    ```
-   If the token is a 1-hour token, paste the app secret (App settings → Basic → Threads app secret) when asked, and the script exchanges it for a 60-day token. The secret itself isn't stored.
+   Tokens from the User Token Generator already last 60 days, so you can press Enter at the app-secret prompt. If you have a 1-hour token instead (e.g. from your own OAuth flow), you **must** paste the app secret (App settings → Basic → Threads app secret), or the token dies within the hour. The script exchanges it for a 60-day token. The secret itself isn't stored.
 6. **Check it works:** `uv run --script C:\Users\courts\threads-mcp\server.py status`
 7. **Search everyone's posts.** To search all public posts and read other people's profiles, submit the app for **App Review** for `threads_keyword_search` and `threads_profile_discovery`. Meta asks for a description of the use case and a screencast. Until it's approved, those tools only return your own posts or Meta's own accounts.
 
-The token refreshes itself once it's more than 3 days old, so it won't hit its 60-day expiry. If a refresh fails, `threads_status` shows the error.
+The token refreshes itself once it's more than 3 days old, so it won't hit its 60-day expiry. If a refresh fails, it retries an hour later and `threads_status` shows the error. Tokens never appear in error messages or logs.
 
 ## Registered in Claude Code
 
