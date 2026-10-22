@@ -13,14 +13,15 @@ from __future__ import annotations
 import csv
 import getpass
 import json
+import logging
 import os
+import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
-
-import logging
 
 import httpx
 from mcp.server.mcpserver import MCPServer
@@ -41,16 +42,51 @@ PROFILE_FIELDS = (
     "likes_count,quotes_count,replies_count,reposts_count,views_count"
 )
 MEDIA_METRICS = "views,likes,replies,reposts,quotes,shares"
-USER_METRICS = "views,likes,replies,reposts,quotes,followers_count"
+USER_METRICS = "views,likes,replies,reposts,quotes"
+FOLLOWERS_METRIC = "followers_count"  # rejected together with since/until
 
 REFRESH_AFTER_SECONDS = 3 * 24 * 3600  # refresh well inside the 60-day lifetime
+RETRY_REFRESH_SECONDS = 3600  # after a failed refresh, try again an hour later
 
 
 class ThreadsError(ToolError):
     """Expected API/token failure; its message reaches the model as-is."""
 
 
-# ---------------------------------------------------------------- token store
+# ---------------------------------------------------------------- HTTP + token
+
+_SECRET_RE = re.compile(r"((?:access_token|client_secret)=)[^&\s\"']+")
+
+
+def _scrub(msg: str, secrets: list[str]) -> str:
+    """Remove tokens and secrets from text that may reach the model or logs."""
+    for s in secrets:
+        if s:
+            msg = msg.replace(s, "***")
+    return _SECRET_RE.sub(r"\1***", msg)
+
+
+def _raw_get(path: str, params: dict[str, Any] | None = None, secrets: list[str] | None = None) -> dict[str, Any]:
+    url = path if path.startswith("http") else f"{API_BASE}/{path.lstrip('/')}"
+    params = params or {}
+    secrets = [str(params[k]) for k in ("access_token", "client_secret") if params.get(k)] + (secrets or [])
+    try:
+        resp = httpx.get(url, params=params or None, timeout=30)
+    except httpx.HTTPError as e:
+        raise ThreadsError(_scrub(f"Network error ({type(e).__name__}): {e}", secrets)) from None
+    try:
+        body = resp.json()
+    except ValueError:
+        raise ThreadsError(_scrub(f"HTTP {resp.status_code}: {resp.text[:300]}", secrets)) from None
+    if resp.status_code >= 400 or "error" in body:
+        err = body.get("error", body)
+        raise ThreadsError(_scrub(
+            f"HTTP {resp.status_code}: {err.get('message', err)} "
+            f"(type={err.get('type')}, code={err.get('code')})",
+            secrets,
+        ))
+    return body
+
 
 def _load_token() -> dict[str, Any]:
     if not TOKEN_FILE.exists():
@@ -62,53 +98,55 @@ def _load_token() -> dict[str, Any]:
 
 def _save_token(data: dict[str, Any]) -> None:
     HOME.mkdir(parents=True, exist_ok=True)
-    TOKEN_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp = TOKEN_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, TOKEN_FILE)  # atomic, so a crash never leaves half a file
 
 
-def _raw_get(path: str, params: dict[str, Any]) -> dict[str, Any]:
-    url = path if path.startswith("http") else f"{API_BASE}/{path.lstrip('/')}"
-    resp = httpx.get(url, params=params, timeout=30)
-    try:
-        body = resp.json()
-    except ValueError:
-        raise ThreadsError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-    if resp.status_code >= 400 or "error" in body:
-        err = body.get("error", body)
-        raise ThreadsError(
-            f"HTTP {resp.status_code}: {err.get('message', err)} "
-            f"(type={err.get('type')}, code={err.get('code')})"
-        )
-    return body
+_token_lock = threading.Lock()
 
 
 def _access_token() -> str:
-    tok = _load_token()
-    age = time.time() - tok.get("obtained_at", 0)
-    since_attempt = time.time() - tok.get("last_refresh_attempt", 0)
-    if age > REFRESH_AFTER_SECONDS and since_attempt > 24 * 3600:
-        tok["last_refresh_attempt"] = time.time()
-        try:
-            body = _raw_get(
-                "refresh_access_token",
-                {"grant_type": "th_refresh_token", "access_token": tok["access_token"]},
-            )
-            tok = {
-                **tok,
-                "last_refresh_error": None,
-                "access_token": body["access_token"],
-                "obtained_at": time.time(),
-                "expires_at": time.time() + int(body.get("expires_in", 0)) if body.get("expires_in") else None,
-            }
+    # Tools run in worker threads; the lock stops two calls refreshing at once.
+    with _token_lock:
+        tok = _load_token()
+        now = time.time()
+        age = now - tok.get("obtained_at", 0)
+        since_attempt = now - tok.get("last_refresh_attempt", 0)
+        if age > REFRESH_AFTER_SECONDS and since_attempt > RETRY_REFRESH_SECONDS:
+            tok["last_refresh_attempt"] = now
+            try:
+                body = _raw_get(
+                    "refresh_access_token",
+                    {"grant_type": "th_refresh_token", "access_token": tok["access_token"]},
+                )
+                expires_in = body.get("expires_in")
+                tok.update(
+                    access_token=body["access_token"],
+                    obtained_at=now,
+                    expires_at=now + int(expires_in) if expires_in else None,
+                    last_refresh_error=None,
+                )
+            except ThreadsError as e:
+                # Not fatal while the old token is still valid; surface it in status.
+                tok["last_refresh_error"] = str(e)
             _save_token(tok)
-        except ThreadsError as e:
-            # Not fatal while the old token is still valid; surface it in status.
-            tok["last_refresh_error"] = str(e)
-            _save_token(tok)
-    return tok["access_token"]
+        return tok["access_token"]
+
+
+def _ts(value: str | None) -> str | None:
+    """Turn YYYY-MM-DD into a Unix timestamp (some endpoints only take those)."""
+    if value and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return str(int(dt.timestamp()))
+    return value
 
 
 def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     params = {k: v for k, v in (params or {}).items() if v not in (None, "")}
+    for key in ("since", "until"):
+        if key in params:
+            params[key] = _ts(params[key])
     params["access_token"] = _access_token()
     return _raw_get(path, params)
 
@@ -118,11 +156,17 @@ def _paged(path: str, params: dict[str, Any], pages: int) -> list[dict[str, Any]
     body = _get(path, params)
     rows.extend(body.get("data", []))
     for _ in range(max(pages, 1) - 1):
-        nxt = body.get("paging", {}).get("next")
-        if not nxt:
+        if not body.get("data"):
+            break  # an empty page can still carry a next link; don't spend quota on it
+        paging = body.get("paging", {})
+        after = paging.get("cursors", {}).get("after")
+        if paging.get("next"):
+            # The next URL already carries every param, including the token.
+            body = _raw_get(paging["next"], secrets=[_access_token()])
+        elif after:
+            body = _get(path, {**params, "after": after})
+        else:
             break
-        # The next URL already carries every param, including the token.
-        body = _raw_get(nxt, {})
         rows.extend(body.get("data", []))
     return rows
 
@@ -148,6 +192,17 @@ def _result(rows: list[dict[str, Any]], export_name: str | None, **meta: Any) ->
     if saved:
         out["csv"] = saved
     return out
+
+
+def _metric_value(m: dict[str, Any]) -> Any:
+    """Insights come back as total_value or as a values series; keep series whole."""
+    total = m.get("total_value")
+    if isinstance(total, dict):
+        return total.get("value")
+    values = m.get("values") or []
+    if len(values) == 1:
+        return values[0].get("value")
+    return values
 
 
 # ---------------------------------------------------------------- MCP tools
@@ -275,21 +330,16 @@ def threads_my_posts(
 def threads_post_insights(media_id: str) -> dict[str, Any]:
     """Views, likes, replies, reposts, quotes and shares for one of your own posts."""
     body = _get(media_id + "/insights", {"metric": MEDIA_METRICS})
-    return {m["name"]: (m.get("values") or [{}])[0].get("value", m.get("total_value", {}).get("value"))
-            for m in body.get("data", [])}
+    return {m["name"]: _metric_value(m) for m in body.get("data", [])}
 
 
 @mcp.tool()
 def threads_my_insights(since: str | None = None, until: str | None = None) -> dict[str, Any]:
-    """Account-level insights for the token owner (views, likes, replies, reposts, quotes, followers)."""
-    body = _get("me/threads_insights", {"metric": USER_METRICS, "since": since, "until": until})
-    out: dict[str, Any] = {}
-    for m in body.get("data", []):
-        if "total_value" in m:
-            out[m["name"]] = m["total_value"].get("value")
-        else:
-            out[m["name"]] = m.get("values")
-    return out
+    """Account-level insights for the token owner (views, likes, replies, reposts, quotes,
+    and followers_count when no date range is given). Dates must be on or after 2024-04-13."""
+    metrics = USER_METRICS if (since or until) else f"{USER_METRICS},{FOLLOWERS_METRIC}"
+    body = _get("me/threads_insights", {"metric": metrics, "since": since, "until": until})
+    return {m["name"]: _metric_value(m) for m in body.get("data", [])}
 
 
 # ---------------------------------------------------------------- CLI
@@ -307,6 +357,7 @@ def _setup() -> None:
     secret = getpass.getpass(
         "Threads app secret, to upgrade a 1-hour token to a 60-day one (Enter to skip): "
     ).strip()
+    exchanged = False
     if secret:
         try:
             body = _raw_get(
@@ -315,15 +366,20 @@ def _setup() -> None:
             )
             token = body["access_token"]
             expires_at = time.time() + int(body.get("expires_in", 0))
-            print("Exchanged for a long-lived token.")
+            exchanged = True
+            print("Exchanged for a long-lived (60-day) token.")
         except ThreadsError as e:
-            print(f"Exchange skipped ({e}); the token may already be long-lived.")
+            print(f"Exchange failed ({e}).")
+    if not exchanged:
+        print("WARNING: token not exchanged. Tokens from the User Token Generator are already")
+        print("60-day tokens and will refresh themselves. A 1-hour token (e.g. from the OAuth")
+        print("flow) will die within the hour; rerun setup with the app secret in that case.")
     _save_token({"access_token": token, "obtained_at": time.time(), "expires_at": expires_at})
     print(f"Saved to {TOKEN_FILE}. The app secret was not stored.")
 
 
 def _status_cli() -> None:
-    print(json.dumps(threads_status(), indent=2))
+    print(json.dumps(threads_status(), indent=2, ensure_ascii=False))
     for name, fn in [
         ("keyword_search (own posts unless approved)", lambda: threads_keyword_search("the", limit=1)),
         ("profile_posts @threads", lambda: threads_profile_posts("threads", limit=1)),
@@ -339,8 +395,10 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
     try:
         if cmd == "setup":
+            sys.stdout.reconfigure(encoding="utf-8")
             _setup()
         elif cmd == "status":
+            sys.stdout.reconfigure(encoding="utf-8")
             _status_cli()
         else:
             mcp.run()
