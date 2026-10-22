@@ -1,2 +1,3 @@
 exports/
 __pycache__/
+.claude/
