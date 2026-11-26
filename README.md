@@ -14,7 +14,7 @@ A read-only MCP server for the official Threads (Meta) API, for analysing topics
 | `threads_get_post` | Fetches one post by ID | `threads_basic` |
 | `threads_my_posts`, `threads_my_insights`, `threads_post_insights` | Your own posts and their stats | `threads_basic`, `threads_manage_insights` |
 
-The list tools take `pages` to page through results (up to 100 rows per page). They also take `export_name`, which saves the rows to `exports/<name>.csv`.
+The list tools take `pages` to page through results (up to 100 rows per page). They also take `export_name`, which saves the rows to `exports/<name>.csv`. Exports never overwrite: if `exports/<name>.csv` already exists, the rows go to `<name>-2.csv`, `<name>-3.csv`, and so on.
 
 Meta's limits: 2,200 keyword searches and 1,000 profile lookups per user per rolling 24 hours. Profile tools only return public accounts with at least 100 followers.
 
@@ -29,7 +29,7 @@ Meta's limits: 2,200 keyword searches and 1,000 profile lookups per user per rol
    uv run --script C:\Users\courts\threads-mcp\server.py setup
    ```
    Tokens from the User Token Generator already last 60 days, so you can press Enter at the app-secret prompt. If you have a 1-hour token instead (e.g. from your own OAuth flow), you **must** paste the app secret (App settings → Basic → Threads app secret), or the token dies within the hour. The script exchanges it for a 60-day token. The secret itself isn't stored.
-6. **Check it works:** `uv run --script C:\Users\courts\threads-mcp\server.py status`
+6. **Check it works:** `uv run --script C:\Users\courts\threads-mcp\server.py status` (only checks the token; append ` --probe` to also test search + profile access)
 7. **Search everyone's posts.** To search all public posts and read other people's profiles, submit the app for **App Review** for `threads_keyword_search` and `threads_profile_discovery`. Meta asks for a description of the use case and a screencast. Until it's approved, those tools only return your own posts or Meta's own accounts.
 
 The token refreshes itself once it's more than 3 days old, so it won't hit its 60-day expiry. If a refresh fails, it retries an hour later and `threads_status` shows the error. Tokens never appear in error messages or logs.
