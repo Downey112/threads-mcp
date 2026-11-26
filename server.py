@@ -7,6 +7,7 @@
 Run as an MCP server:   uv run --script server.py
 One-time token setup:   uv run --script server.py setup
 Check the token:        uv run --script server.py status
+Also test search + profile access:  uv run --script server.py status --probe
 """
 from __future__ import annotations
 
@@ -176,7 +177,11 @@ def _export(rows: list[dict[str, Any]], name: str | None) -> str | None:
         return None
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    n = 1
     path = EXPORT_DIR / f"{safe}.csv"
+    while path.exists():
+        n += 1
+        path = EXPORT_DIR / f"{safe}-{n}.csv"
     cols = sorted({k for r in rows for k in r})
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=cols)
@@ -297,12 +302,18 @@ def threads_post_replies(
     media_id: str,
     scope: Literal["replies", "conversation"] = "replies",
     reverse: bool = False,
+    limit: int = 100,
     pages: int = 1,
     export_name: str | None = None,
 ) -> dict[str, Any]:
     """Get replies to a post. scope=replies gives top-level replies; conversation gives
     every reply at any depth. Meta may refuse this for posts you don't own."""
-    rows = _paged(media_id + "/" + scope, {"fields": REPLY_FIELDS, "reverse": str(reverse).lower()}, pages)
+    params = {
+        "fields": REPLY_FIELDS,
+        "reverse": str(reverse).lower() if reverse else None,
+        "limit": min(max(limit, 1), 100),
+    }
+    rows = _paged(media_id + "/" + scope, params, pages)
     return _result(rows, export_name, media_id=media_id, scope=scope)
 
 
@@ -365,7 +376,8 @@ def _setup() -> None:
                 {"grant_type": "th_exchange_token", "client_secret": secret, "access_token": token},
             )
             token = body["access_token"]
-            expires_at = time.time() + int(body.get("expires_in", 0))
+            expires_in = body.get("expires_in")
+            expires_at = time.time() + int(expires_in) if expires_in else None
             exchanged = True
             print("Exchanged for a long-lived (60-day) token.")
         except ThreadsError as e:
@@ -378,8 +390,10 @@ def _setup() -> None:
     print(f"Saved to {TOKEN_FILE}. The app secret was not stored.")
 
 
-def _status_cli() -> None:
+def _status_cli(probe: bool = False) -> None:
     print(json.dumps(threads_status(), indent=2, ensure_ascii=False))
+    if not probe:
+        return
     for name, fn in [
         ("keyword_search (own posts unless approved)", lambda: threads_keyword_search("the", limit=1)),
         ("profile_posts @threads", lambda: threads_profile_posts("threads", limit=1)),
@@ -399,7 +413,7 @@ if __name__ == "__main__":
             _setup()
         elif cmd == "status":
             sys.stdout.reconfigure(encoding="utf-8")
-            _status_cli()
+            _status_cli("--probe" in sys.argv)
         else:
             mcp.run()
     except ThreadsError as e:
